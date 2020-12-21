@@ -1,5 +1,10 @@
 # Genetic / Evolutionary Algorithms
-
+- [Introduction to Genetic Algorithms](https://towardsdatascience.com/introduction-to-genetic-algorithms-including-example-code-e396e98d8bf3)
+- Knapsack Problem
+- Traveling Salesman Problem
+- 4bit Deceptive Problem
+- Neural Network Architecture Optimization
+ 
 ## Knapsack Problem
 ![Knapsack Problem](https://upload.wikimedia.org/wikipedia/commons/f/fd/Knapsack.svg)
 
