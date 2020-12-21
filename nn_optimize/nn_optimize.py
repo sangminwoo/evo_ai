@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+import copy
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -12,6 +13,9 @@ import matplotlib.pyplot as plt
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from torch.utils.data import DataLoader
@@ -34,7 +38,10 @@ def get_model(state_dict=None):
     model.eval()
     return model
 
-def model_assessment(dataloader, acc, logger):
+def model_assessment(dataloader, logger, model):
+	model.eval()
+	acc = AverageMeter()
+
 	for idx, (input, target) in enumerate(dataloader):
 		input = input.cuda()
 		target = target.cuda() # batch_size
@@ -43,10 +50,7 @@ def model_assessment(dataloader, acc, logger):
 		correct = int(torch.sum(torch.max(output, dim=1)[1] == target))
 		acc.update(correct, input.size(0))
 
-	logger.info('---------------------------------------'*2)
-	logger.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Model Accuracy")
 	logger.info(f"average acc:{acc.avg*100:.2f}%")
-	logger.info('---------------------------------------'*2)
 
 	return acc.avg
 
@@ -68,8 +72,11 @@ class AverageMeter:
 
 class NNOptimize:
 	# Neural Network Optimization
-	def __init__(self, crossover_algorithm, crossover_prob, crossover_points, mutation_prob,
-				 population_size, individual_len, num_generations, selection_algorithm):
+	def __init__(self, model, dataloader, logger, crossover_algorithm, crossover_prob, crossover_points,
+				 mutation_prob, population_size, individual_len, num_generations, selection_algorithm):
+		self.model = model
+		self.dataloader = dataloader
+		self.logger = logger
 		self.crossover_algorithm = crossover_algorithm
 		self.crossover_prob = crossover_prob
 		self.crossover_points = crossover_points
@@ -80,11 +87,21 @@ class NNOptimize:
 		self.selection_algorithm = selection_algorithm
 
 	def init_population(self):
-		return np.stack([np.random.choice(2, self.individual_len, replace=True) for _ in range(self.population_size*2)]) # 50*2x1000x10
+		return np.stack([np.random.choice(2, self.individual_len, replace=True) for _ in range(self.population_size*2)]) # 50*2x10000
 
 	def fitness(self, string):
-		# TODO
-		return fitness
+		string = string.reshape(10, 1000)
+		model = copy.deepcopy(self.model)
+		# single-gpu
+		minimized_weight = list(model.children())[-1].weight * torch.from_numpy(string).cuda() 
+		# multi-gpu
+		# model_sequential = list(self.model.children())[0]
+		# minimized_weight = list(model_sequential.children())[-1].weight * torch.from_numpy(string).cuda() 
+		model[-1].weight = nn.Parameter(minimized_weight)
+		acc = model_assessment(self.dataloader, self.logger, model)
+
+		alpha = 1 if acc >= 0.99 else 0
+		return alpha * (self.individual_len - np.sum(string))
 
 	def selection_rws(self, fitness, population):
 		# Roulette wheel selection
@@ -260,7 +277,7 @@ class NNOptimize:
 		population = self.init_population()
 
 		for i in range(self.num_generations):
-			fitness = np.array([self.fitness(indv) for indv in population])
+			fitness = np.array([self.fitness(indv) for indv in population]) # 50x10000
 			fitness_history.append(fitness)
 			
 			# selection
@@ -281,8 +298,12 @@ class NNOptimize:
 
 			population = self.mutation(children)
 
-			if (i+1)%10 == 0:
-				print(f'{i+1}th generation population: {population}')
+			if (i+1)%1 == 0:
+				logger.info('---------------------------------------'*2)
+				logger.info(f"[{i+1}th generation]")
+				logger.info(f"fitness: {np.mean(fitness):.2f}")
+				# logger.info(f"population: {population}")
+				logger.info('---------------------------------------'*2)
 
 		fitness = np.array([self.fitness(indv) for indv in population])
 		max_fitness = np.where(fitness == np.max(fitness))
@@ -328,6 +349,8 @@ def plot_fitness(iter, save_dir, num_generations, fitness_history):
 
 if __name__=='__main__':
 	parser = argparse.ArgumentParser(description='Neural Network Optimization')
+	parser.add_argument('--dist', action='store_true', help='distributed mode')
+	parser.add_argument('--local_rank', type=int, default=0)
 	parser.add_argument('--iter', type=str, help='ith iteration', required=True)
 	parser.add_argument('--root', type=str, help='directory to save datasets', default='./data')
 	parser.add_argument('--gen', type=int, help='number of generations', default=200)
@@ -346,29 +369,45 @@ if __name__=='__main__':
 		random.seed(args.seed)
 		np.random.seed(args.seed)
 		torch.manual_seed(args.seed)
+		torch.cuda.manual_seed(args.seed)
+		torch.cuda.manual_seed_all(args.seed) # if use multi-GPU
 		cudnn.deterministic = True
+		cudnn.benchmark = False
+
+	# model
+	model = get_model(state_dict='model(1.0).pt')
+	model = model.cuda()
+
+	# distributed
+	if args.dist:
+		ngpus_per_node = torch.cuda.device_count()
+		world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+		rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 1
+
+		dist.init_process_group(backend='nccl')
+		if dist.is_available() and dist.is_initialized() and world_size > 1:
+			dist.barrier()
+
+		model = DistributedDataParallel(model, device_ids=list(range(ngpus_per_node)))
 
 	# dataset
 	transform = transforms.ToTensor()
 	mnist = MNIST(root=args.root, train=True, download=not os.path.exists(args.root), transform=transform)
-	dataloader = DataLoader(mnist, batch_size=512, shuffle=True, num_workers=16)
-	
-	# model
-	model = get_model(state_dict='model(1.0).pt')
-	model = nn.DataParallel(model, device_ids=list(range(torch.cuda.device_count())))
-	model = model.cuda()
-	model.eval()
+	dataloader = DataLoader(mnist, batch_size=len(mnist), shuffle=True, num_workers=32)
 
+	# logger
 	logger = setup_logger(name=args.iter, save_dir='logs', filename='{}_nn_optimize_{}.txt'.format(get_timestamp(), args.iter))
 	logger = logging.getLogger(args.iter)
-	acc = AverageMeter()
 
-	# model assessment
+	# pre-model assessment
 	logger.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Pre-accuracy assessment")
-	model_assessment(dataloader, acc, logger)
+	model_assessment(dataloader, logger, model)
 
 	# neural net optimizer
-	nn_optimize = NNOptimize(crossover_algorithm=args.c_alg,
+	nn_optimize = NNOptimize(model=model,
+							 dataloader=dataloader,
+							 logger=logger,
+							 crossover_algorithm=args.c_alg,
 							 crossover_prob=args.c_prob,
 							 crossover_points=args.c_point,
 							 mutation_prob=args.m_prob,
