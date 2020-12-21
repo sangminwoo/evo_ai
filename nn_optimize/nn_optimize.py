@@ -15,30 +15,31 @@ import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+from comm import synchronize
 
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from torch.utils.data import DataLoader
 
 def get_model(state_dict=None):
-    model = nn.Sequential(
-        nn.Flatten(),
-        nn.Linear(784, 1000, bias=True),
-        nn.Sigmoid(),
-        nn.Linear(1000, 10, bias=False)
-    )
+	model = nn.Sequential(
+		nn.Flatten(),
+		nn.Linear(784, 1000, bias=True),
+		nn.Sigmoid(),
+		nn.Linear(1000, 10, bias=False)
+	)
 
-    if state_dict is None:
-        return model
+	if state_dict is None:
+		return model
 
-    if isinstance(state_dict, str):
-        state_dict = torch.load(state_dict)
+	if isinstance(state_dict, str):
+		state_dict = torch.load(state_dict)
 
-    model.load_state_dict(state_dict)
-    model.eval()
-    return model
+	model.load_state_dict(state_dict)
+	model.eval()
+	return model
 
-def model_assessment(dataloader, logger, model):
+def model_eval(dataloader, logger, model):
 	model.eval()
 	acc = AverageMeter()
 
@@ -50,41 +51,41 @@ def model_assessment(dataloader, logger, model):
 		correct = int(torch.sum(torch.max(output, dim=1)[1] == target))
 		acc.update(correct, input.size(0))
 
-	logger.info(f"average acc:{acc.avg*100:.2f}%")
-
 	return acc.avg
 
 class AverageMeter:
-    def __init__(self):
-        self.reset()
+	def __init__(self):
+		self.reset()
 
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
+	def reset(self):
+		self.val = 0
+		self.avg = 0
+		self.sum = 0
+		self.count = 0
 
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val #* n
-        self.count += n
-        self.avg = self.sum / self.count
+	def update(self, val, n=1):
+		self.val = val
+		self.sum += val #* n
+		self.count += n
+		self.avg = self.sum / self.count
 
 class NNOptimize:
 	# Neural Network Optimization
-	def __init__(self, model, dataloader, logger, crossover_algorithm, crossover_prob, crossover_points,
-				 mutation_prob, population_size, individual_len, num_generations, selection_algorithm):
+	def __init__(self, distributed, model, dataloader, logger, num_generations, population_size, individual_len, selection_algorithm,
+				 elite, crossover_algorithm, crossover_prob, crossover_points, mutation_prob):
+		self.distributed = distributed
 		self.model = model
 		self.dataloader = dataloader
 		self.logger = logger
+		self.num_generations = num_generations
+		self.population_size = population_size
+		self.individual_len = individual_len
+		self.selection_algorithm = selection_algorithm
+		self.elite = elite
 		self.crossover_algorithm = crossover_algorithm
 		self.crossover_prob = crossover_prob
 		self.crossover_points = crossover_points
 		self.mutation_prob = mutation_prob
-		self.population_size = population_size
-		self.individual_len = individual_len
-		self.num_generations = num_generations
-		self.selection_algorithm = selection_algorithm
 
 	def init_population(self):
 		return np.stack([np.random.choice(2, self.individual_len, replace=True) for _ in range(self.population_size*2)]) # 50*2x10000
@@ -92,16 +93,19 @@ class NNOptimize:
 	def fitness(self, string):
 		string = string.reshape(10, 1000)
 		model = copy.deepcopy(self.model)
-		# single-gpu
-		minimized_weight = list(model.children())[-1].weight * torch.from_numpy(string).cuda() 
-		# multi-gpu
-		# model_sequential = list(self.model.children())[0]
-		# minimized_weight = list(model_sequential.children())[-1].weight * torch.from_numpy(string).cuda() 
-		model[-1].weight = nn.Parameter(minimized_weight)
-		acc = model_assessment(self.dataloader, self.logger, model)
-
+		
+		if not self.distributed: # single-gpu
+			minimized_weight = list(model.children())[-1].weight * torch.from_numpy(string).cuda() 
+			model[-1].weight = nn.Parameter(minimized_weight)
+		else: # multi-gpu
+			model_sequential = list(self.model.children())[0]
+			minimized_weight = list(model_sequential.children())[-1].weight * torch.from_numpy(string).cuda() 
+			model_sequential[-1].weight = nn.Parameter(minimized_weight)
+		
+		acc = model_eval(self.dataloader, self.logger, model)
 		alpha = 1 if acc >= 0.99 else 0
-		return alpha * (self.individual_len - np.sum(string))
+
+		return acc, alpha * (self.individual_len - np.sum(string))
 
 	def selection_rws(self, fitness, population):
 		# Roulette wheel selection
@@ -273,13 +277,22 @@ class NNOptimize:
 		return children
 
 	def run(self):
+		time_meter = AverageMeter()
+		end = time.time()
+
 		fitness_history = []
 		population = self.init_population()
 
-		for i in range(self.num_generations):
-			fitness = np.array([self.fitness(indv) for indv in population]) # 50x10000
+		for iteration in range(self.num_generations):
+			accs = []; fits = []
+			for indv in population:
+				acc, fit = self.fitness(indv)
+				accs.append(acc)
+				fits.append(fit)
+			accuracy = np.array(accs)
+			fitness = np.array(fits)
 			fitness_history.append(fitness)
-			
+
 			# selection
 			if self.selection_algorithm == 'rws':
 				parents = self.selection_rws(fitness, population)
@@ -298,17 +311,37 @@ class NNOptimize:
 
 			population = self.mutation(children)
 
-			if (i+1)%1 == 0:
-				logger.info('---------------------------------------'*2)
-				logger.info(f"[{i+1}th generation]")
-				logger.info(f"fitness: {np.mean(fitness):.2f}")
-				# logger.info(f"population: {population}")
-				logger.info('---------------------------------------'*2)
+			batch_time = time.time() - end
+			end = time.time()
+			time_meter.update(batch_time)
+			eta_seconds = time_meter.avg * (self.num_generations - iteration)
+			eta_string = str(timedelta(seconds=int(eta_seconds)))
 
-		fitness = np.array([self.fitness(indv) for indv in population])
+			if (iteration+1)%1 == 0:
+				logger.info(
+					"  ".join(
+						[
+						"iter: {iter}",
+						"mean acc: {mean_acc:.2f}",
+						"mean fitness: {mean_fit:.2f}",
+						"max fitness: {max_fit:.2f}",
+						"eta: {eta}",
+						"max mem: {memory:.0f}",
+						]
+					).format(
+						iter=iteration+1,
+						mean_acc=np.mean(accuracy)*100,
+						mean_fit=np.mean(fitness),
+						max_fit=np.max(fitness),
+						eta=eta_string,
+						memory=torch.cuda.max_memory_allocated() / 1024.0 / 1024.0,
+					)
+				)
+
+		fitness = np.array([self.fitness(indv)[1] for indv in population])
 		max_fitness = np.where(fitness == np.max(fitness))
-		parameters = population[max_fitness[0][0]]
-		return parameters, fitness_history
+		optim_indv = population[max_fitness[0][0]]
+		return optim_indv, fitness_history
 
 def setup_logger(name, save_dir, filename="log.txt"):
 	if not os.path.exists(save_dir):
@@ -349,7 +382,6 @@ def plot_fitness(iter, save_dir, num_generations, fitness_history):
 
 if __name__=='__main__':
 	parser = argparse.ArgumentParser(description='Neural Network Optimization')
-	parser.add_argument('--dist', action='store_true', help='distributed mode')
 	parser.add_argument('--local_rank', type=int, default=0)
 	parser.add_argument('--iter', type=str, help='ith iteration', required=True)
 	parser.add_argument('--root', type=str, help='directory to save datasets', default='./data')
@@ -357,6 +389,7 @@ if __name__=='__main__':
 	parser.add_argument('--pop', type=int, help='population size', default=50)
 	parser.add_argument('--indv', type=int, help='individual length', default=10000)
 	parser.add_argument('--sel', type=str, help='selection algorithm (pwts; rws; rank)', default='pwts')
+	parser.add_argument('--elite', type=int, help='number of individuals surviving a generation (elitism)', default=1)
 	parser.add_argument('--c_alg', type=str, help='crossover algorithm (uniform; pointwise; bbwise)', default='pointwise')
 	parser.add_argument('--c_prob', type=float, help='crossover probability', default=1.0)
 	parser.add_argument('--c_point', type=int, help='crossover points', default=3)
@@ -379,53 +412,56 @@ if __name__=='__main__':
 	model = model.cuda()
 
 	# distributed
+	num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
+	args.dist = num_gpus > 1
 	if args.dist:
-		ngpus_per_node = torch.cuda.device_count()
-		world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-		rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 1
-
-		dist.init_process_group(backend='nccl')
-		if dist.is_available() and dist.is_initialized() and world_size > 1:
-			dist.barrier()
-
-		model = DistributedDataParallel(model, device_ids=list(range(ngpus_per_node)))
+		torch.cuda.set_device(args.local_rank)
+		dist.init_process_group(backend='nccl', init_method='env://')
+		synchronize()
+		model = DistributedDataParallel(model, device_ids=list(range(torch.cuda.device_count())))
 
 	# dataset
 	transform = transforms.ToTensor()
 	mnist = MNIST(root=args.root, train=True, download=not os.path.exists(args.root), transform=transform)
-	dataloader = DataLoader(mnist, batch_size=len(mnist), shuffle=True, num_workers=32)
+	dataloader = DataLoader(mnist, batch_size=4096, shuffle=True, num_workers=32)
 
 	# logger
 	logger = setup_logger(name=args.iter, save_dir='logs', filename='{}_nn_optimize_{}.txt'.format(get_timestamp(), args.iter))
 	logger = logging.getLogger(args.iter)
+	logger.info(args)
 
 	# pre-model assessment
-	logger.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Pre-accuracy assessment")
-	model_assessment(dataloader, logger, model)
+	logger.info('---------------------------------------'*2)
+	logger.info("Pre-accuracy assessment")
+	acc = model_eval(dataloader, logger, model)
+	logger.info(f"training acc:{acc*100:.2f}%")
+	logger.info('---------------------------------------'*2)
 
 	# neural net optimizer
-	nn_optimize = NNOptimize(model=model,
+	nn_optimize = NNOptimize(distributed=args.dist,
+							 model=model,
 							 dataloader=dataloader,
 							 logger=logger,
+							 num_generations=args.gen,
+							 population_size=args.pop,
+							 individual_len=args.indv,
+							 elite=args.elite,
+							 selection_algorithm=args.sel, # rws, pwts, rank
 							 crossover_algorithm=args.c_alg,
 							 crossover_prob=args.c_prob,
 							 crossover_points=args.c_point,
 							 mutation_prob=args.m_prob,
-							 population_size=args.pop,
-							 individual_len=args.indv,
-							 num_generations=args.gen,
-							 selection_algorithm=args.sel) # rws, pwts, rank
-
-	logger.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Start training")
-	parameters, fitness_history = nn_optimize.run()
+							)
+	optim_indv, fitness_history = nn_optimize.run()
+	torch.save(optim_indv, )
 
 	delimeter = "   "
 	logger.info(
 				delimeter.join(
-					["Optimal individual: {indv}",
-					 "Maximum fitness: {fitness}"]
+					["optimal individual: {optim_indv}",
+					 "maximum fitness: {fitness}"]
 				 ).format(
-					indv=parameters,
+					optim_indv=optim_indv,
 					fitness=max(fitness_history[-1]))
 			)
 

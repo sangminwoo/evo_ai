@@ -1,4 +1,5 @@
 *.png
-data
-logs
-gen500_logs
+*.pyc
+
+data/
+logs/
